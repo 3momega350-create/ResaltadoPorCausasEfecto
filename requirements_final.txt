@@ -1,0 +1,5 @@
+spacy==3.7.2
+pypdf==3.13.0
+tqdm==4.65.0
+pytesseract==0.3.10
+pdf2image==1.16.3
