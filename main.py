@@ -1,173 +1,300 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox
-import spacy
-try:
-    from pypdf import PdfReader as PDFReader
-except Exception:
-    # fallback to PyPDF2 if pypdf not installed
-    import PyPDF2
-    PDFReader = PyPDF2.PdfReader
-from spacy.matcher import Matcher
-from spacy.pipeline import EntityRuler
-import logging
-from tqdm import tqdm
+"""Launcher mínimo: sólo importa y orquesta las llamadas entre módulos.
 
-# --- 1. Lógica de NLP (Procesamiento y Extracción) ---
+Este archivo debe contener únicamente la lógica de orquestación —toda la
+funcionalidad real vive en los módulos: `spacy_utils`, `matcher_utils`,
+`pdf_utils`, `heuristics`, `analyzer`, `html_utils` y `gui`.
+"""
 
-# Cargar el modelo de lenguaje de spaCy
-print("Loading spaCy model...")
-try:
-    nlp = spacy.load("en_core_web_lg")
-except OSError:
-    print("Model 'en_core_web_lg' not found.")
-    # Intentar cargar un modelo más pequeño si está disponible
-    try:
-        nlp = spacy.load("en_core_web_sm")
-        print("Loaded fallback model 'en_core_web_sm'. Consider installing 'en_core_web_lg' for better results.")
-    except OSError:
-        # Como último recurso, crear un modelo en blanco con sentencizer para permitir pruebas y evitar SystemExit
-        print("Fallback model 'en_core_web_sm' not found. Using a blank English pipeline (limited functionality).")
-        nlp = spacy.blank("en")
-        # Añadir sentencizer para que `.sents` y separación de oraciones funcione
+import sys
+from spacy_utils import load_spacy_model
+from analyzer import analyze_text
+from pdf_utils import extract_text_from_pdf, extract_text_from_scanned_pdf
+from html_utils import generate_html_report
+
+
+def select_file_and_process(path: str):
+    """Orquesta el pipeline: extrae texto, carga spaCy, analiza y escribe HTML.
+
+    Esta función delega todo a los módulos apropiados.
+    """
+    if not path or not path.strip():
+        raise FileNotFoundError(path)
+    ext = path.split('.')[-1].lower()
+    if ext == 'pdf':
+        text = extract_text_from_pdf(path)
+        if not text.strip():
+            text = extract_text_from_scanned_pdf(path)
+    else:
+        with open(path, 'r', encoding='utf-8') as fh:
+            text = fh.read()
+
+    nlp = load_spacy_model()
+    highlights = analyze_text(text, nlp)
+    generate_html_report(text, highlights)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) > 1:
+        select_file_and_process(sys.argv[1])
+    else:
         try:
-            nlp.add_pipe("sentencizer")
+            from gui import run_gui
+            run_gui()
         except Exception:
-            pass
-print("Model loaded successfully.")
+            print("Uso: python main.py <archivo>\nO la GUI no está disponible.")
 
-# Setup basic logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-def setup_causal_matcher(nlp_model):
-    """Crea y configura el Matcher de spaCy con patrones de causalidad."""
-    matcher = Matcher(nlp_model.vocab)
-    # Añadir EntityRuler con patrones simples para mejorar detección
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """Extrae texto de un PDF. Usa `pypdf` si está disponible o `PyPDF2` como fallback.
+
+    Devuelve cadena (vacía si falla).
+    """
     try:
-        ruler = EntityRuler(nlp_model, overwrite_ents=False)
-        patterns = [
-            {"label": "CAUSAL_MARKER", "pattern": "because"},
-            {"label": "CAUSAL_MARKER", "pattern": "due to"},
-            {"label": "CAUSAL_MARKER", "pattern": "caused by"},
-            {"label": "CAUSAL_MARKER", "pattern": "leads to"},
-            {"label": "CAUSAL_MARKER", "pattern": "led to"},
-            {"label": "CAUSAL_MARKER", "pattern": "if"},
-            {"label": "CAUSAL_MARKER", "pattern": "therefore"},
-        ]
-        ruler.add_patterns(patterns)
-        # Insert ruler early so it's available for matching
-        nlp_model.add_pipe(ruler, before="parser")
+        from pypdf import PdfReader
+        reader = PdfReader(pdf_path)
+        texts = []
+        for page in getattr(reader, 'pages', []):
+            try:
+                texts.append(page.extract_text() or "")
+            except Exception:
+                texts.append("")
+        return "\n".join(texts)
     except Exception:
-        logger.debug("EntityRuler not added (spaCy version incompatibility).")
-
-    # Patrón 1: EFFECT because (of) CAUSE
-    # Ejemplo: "The mission failed because of the engine."
-    pattern1 = [{"LEMMA": {"IN": ["because", "due to", "as a result of", "owing to"]}}, {"OP": "?"}, {"POS": "DET", "OP": "?"}, {"POS": "NOUN"}]
-    
-    # Patrón 2: CAUSE leads to EFFECT
-    # Ejemplo: "The storm led to power outages."
-    pattern2 = [{"DEP": "nsubj"}, {"LEMMA": {"IN": ["lead", "cause", "result", "produce"]}}, {"OP": "*"}, {"LOWER": "to", "OP": "?"}, {"DEP": "dobj"}]
-
-    # Patrón 3: If CAUSE, then EFFECT
-    # Ejemplo: "If you heat water, it boils."
-    pattern3 = [{"LOWER": "if"}, {"DEP": "nsubj"}, {"DEP": "ROOT"}, {"IS_PUNCT": True, "LOWER": ","}, {"LOWER": "then", "OP": "?"}, {"DEP": "nsubj"}]
-
-    # NOTA: Estos patrones son simplificados. La extracción causal real puede ser muy compleja.
-    # Asociamos patrones a etiquetas; los patrones devuelven un span que usaremos
-    # como punto de partida para extraer sub-spans de causa y efecto.
-    matcher.add("CausalPattern", [pattern1, pattern2, pattern3])
-    return matcher
-
-def extract_text_from_pdf(pdf_path):
-    """Extrae texto de un archivo PDF."""
-    try:
-        text = ""
-        with open(pdf_path, 'rb') as file:
-            reader = PDFReader(file)
-            # pypdf and PyPDF2 expose pages slightly differently
-            pages = getattr(reader, 'pages', None) or getattr(reader, 'pages', None)
-            for page in pages:
+        try:
+            import PyPDF2
+            reader = PyPDF2.PdfReader(pdf_path)
+            texts = []
+            for page in reader.pages:
                 try:
-                    page_text = page.extract_text()
+                    texts.append(page.extract_text() or "")
                 except Exception:
-                    # support older PyPDF2 API
-                    page_text = page.extractText() if hasattr(page, 'extractText') else None
-                if page_text:
-                    text += page_text + "\n"
-        return text
-    except Exception as e:
-        messagebox.showerror("Error", f"Could not read PDF file: {e}")
-        logger.exception("PDF read error")
-        return None
+                    texts.append("")
+            return "\n".join(texts)
+        except Exception:
+            logger.exception("Error extrayendo texto del PDF. Instale 'pypdf' o 'PyPDF2'.")
+            return ""
 
 
-def extract_text_from_scanned_pdf(pdf_path, dpi=200):
-    """Extrae texto de PDFs escaneados usando OCR (pytesseract + pdf2image)."""
+def extract_text_from_scanned_pdf(pdf_path: str, dpi: int = 200) -> str:
+    """OCR para PDFs escaneados (requiere `pdf2image` y `pytesseract`)."""
     try:
         from pdf2image import convert_from_path
         import pytesseract
-    except Exception as e:
-        logger.error("OCR dependencies not installed: %s", e)
-        return None
+    except Exception:
+        logger.exception("Dependencias OCR no instaladas ('pdf2image','pytesseract').")
+        return ""
     try:
-        images = convert_from_path(pdf_path, dpi=dpi)
-        text = ""
-        for img in images:
-            text += pytesseract.image_to_string(img) + "\n"
-        return text
-    except Exception as e:
-        logger.exception("OCR extraction failed")
-        return None
+        pages = convert_from_path(pdf_path, dpi=dpi)
+        texts = [pytesseract.image_to_string(img) for img in pages]
+        return "\n".join(texts)
+    except Exception:
+        logger.exception("Error durante OCR del PDF escaneado.")
+        return ""
 
-def analyze_text(text, matcher):
-    """Analiza el texto para encontrar coincidencias causales y devuelve los spans."""
+
+def extract_cause_effect(sent):
+    """Heurísticas para extraer spans aproximados de causa y efecto en una oración.
+
+    - Devuelve lista de tuplas (role, start_char, end_char).
+    - Reemplaza o amplía estas reglas según necesites más precisión.
+    """
+    text = sent.text
+    lower = text.lower()
+    base = sent.start_char
+
+    # 'because' -> antes = efecto, después = causa (estructura común)
+    if 'because' in lower:
+        idx = lower.find('because')
+        left = text[:idx].strip()
+        right = text[idx + len('because'):].strip(' ,.')
+        spans = []
+        if left:
+            s = base + text.find(left)
+            spans.append(('effect', s, s + len(left)))
+        if right:
+            s2 = base + text.find(right)
+            spans.append(('cause', s2, s2 + len(right)))
+        return spans
+
+    # 'if X, then Y' -> X=cause, Y=effect
+    m = re.search(r"\bif\b\s*(.+?),\s*(then\s*)?(.+)", lower)
+    if m:
+        cause = m.group(1).strip()
+        effect = m.group(3).strip()
+        if cause and effect:
+            s1 = base + text.lower().find(cause)
+            s2 = base + text.lower().find(effect)
+            return [('cause', s1, s1 + len(cause)), ('effect', s2, s2 + len(effect))]
+
+    # 'X leads to Y'
+    m2 = re.search(r"(.+?)\s+lead[s]?\s+to\s+(.+)", lower)
+    if m2:
+        left = m2.group(1).strip()
+        right = m2.group(2).strip()
+        s1 = base + text.lower().find(left)
+        s2 = base + text.lower().find(right)
+        return [('cause', s1, s1 + len(left)), ('effect', s2, s2 + len(right))]
+
+    return []
+
+
+def normalize_and_merge_spans(text, spans):
+    """Normaliza y resuelve solapamientos entre spans detectados."""
+    normalized = []
+    for s in spans:
+        if isinstance(s, dict):
+            normalized.append((s.get('role'), s.get('start'), s.get('end')))
+        else:
+            normalized.append(s)
+
+    if not normalized:
+        return []
+
+    normalized.sort(key=lambda x: (x[1], -(x[2] - x[1])))
+    merged = []
+    for role, start, end in normalized:
+        if not merged:
+            merged.append([role, start, end])
+            continue
+        last_role, last_s, last_e = merged[-1]
+        if start <= last_e:
+            priority = {'cause': 2, 'effect': 2, 'causal_sentence': 1}
+            if priority.get(role, 0) > priority.get(last_role, 0):
+                merged[-1] = [role, start, max(end, last_e)]
+            else:
+                merged[-1][2] = max(last_e, end)
+        else:
+            merged.append([role, start, end])
+
+    return [{'role': r, 'start': a, 'end': b, 'text': text[a:b]} for r, a, b in merged]
+
+
+def analyze_text(text: str, matcher):
+    """Orquesta el análisis de un texto y devuelve los highlights listos para HTML."""
     doc = nlp(text)
-    matches = matcher(doc)
-    
     highlights = []
-    # Nueva lógica: para cada coincidencia intentamos extraer sub-spans de causa y efecto
-    matched_sentences = set()
 
+    matches = matcher(doc)
+    seen = set()
     for match_id, start, end in matches:
         span = doc[start:end]
-        sent_span = span.sent
-
-        # Evitar duplicados si varios patrones coinciden en la misma oración
-        if sent_span.start in matched_sentences:
+        sent = span.sent
+        if sent.start in seen:
             continue
-
-        # Intentar extraer causa y efecto dentro de la oración
-        cause_effect_spans = extract_cause_effect(sent_span)
-
-        if cause_effect_spans:
-            # Añadir spans individuales (cause/effect) para resaltado
-            for role, s_char, e_char in cause_effect_spans:
-                highlights.append((role, s_char, e_char))
+        ce = extract_cause_effect(sent)
+        if ce:
+            for role, a, b in ce:
+                highlights.append({'role': role, 'start': a, 'end': b, 'text': text[a:b]})
         else:
-            # Fallback: resaltar la oración completa como causal_sentence
-            highlights.append(('causal_sentence', sent_span.start_char, sent_span.end_char))
+            highlights.append({'role': 'causal_sentence', 'start': sent.start_char, 'end': sent.end_char, 'text': sent.text})
+        seen.add(sent.start)
 
-        matched_sentences.add(sent_span.start)
+    if not highlights:
+        causal_markers = ["because", "due to", "as a result", "leads to", "lead to", "if", "then"]
+        for sent in doc.sents:
+            if any(m in sent.text.lower() for m in causal_markers):
+                ce = extract_cause_effect(sent)
+                if ce:
+                    for role, a, b in ce:
+                        highlights.append({'role': role, 'start': a, 'end': b, 'text': text[a:b]})
+                else:
+                    highlights.append({'role': 'causal_sentence', 'start': sent.start_char, 'end': sent.end_char, 'text': sent.text})
 
-    # Extra: revisar oraciones que no coinciden con el matcher pero contienen marcadores causales
-    causal_markers = ["because", "due to", "if", "then", "therefore", "led to", "leads to", "caused by", "therefore", "thus", "so"]
-    for sent in doc.sents:
-        if sent.start in matched_sentences:
-            continue
-        s_text = sent.text.lower()
-        if any(m in s_text for m in causal_markers):
-            cause_effect_spans = extract_cause_effect(sent)
-            if cause_effect_spans:
-                for role, s_char, e_char in cause_effect_spans:
-                    highlights.append((role, s_char, e_char))
-            else:
-                highlights.append(('causal_sentence', sent.start_char, sent.end_char))
-            matched_sentences.add(sent.start)
+    return normalize_and_merge_spans(text, highlights)
 
-    # Normalizar y unir spans solapados/contiguos: causa > efecto > causal_sentence
-    highlights = normalize_and_merge_spans(text, highlights)
 
-    return highlights
+def generate_html_report(text: str, highlights, out_path: str = "highlighted_report.html"):
+    """Genera un HTML con los spans resaltados. Modifica `css` para cambiar estilos."""
+    css = """
+    body { font-family: sans-serif; line-height: 1.6; padding: 20px; }
+    .causal_sentence { background-color: #fff8c4; padding: 3px; border-radius: 4px; }
+    .cause { background-color: #ffd6d6; padding: 2px; border-radius: 3px; }
+    .effect { background-color: #d6ffd6; padding: 2px; border-radius: 3px; }
+    .legend span { display:inline-block; margin-right:10px; padding:4px; border-radius:4px; }
+    """
+
+    pieces = []
+    last = 0
+    hs = sorted(highlights, key=lambda h: h['start']) if highlights else []
+    for h in hs:
+        if h['start'] > last:
+            pieces.append(text[last:h['start']])
+        seg = text[h['start']:h['end']]
+        pieces.append(f'<span class="{h["role"]}">{seg}</span>')
+        last = h['end']
+    if last < len(text):
+        pieces.append(text[last:])
+
+    html = f"""
+    <html>
+    <head><meta charset='utf-8'><style>{css}</style></head>
+    <body>
+    <h1>Causal Analysis Report</h1>
+    <div class='legend'><span class='cause'>Cause</span> <span class='effect'>Effect</span> <span class='causal_sentence'>Causal sentence</span></div>
+    <div class='content'>
+    {''.join(pieces)}
+    </div>
+    </body>
+    </html>
+    """
+
+    with open(out_path, 'w', encoding='utf-8') as fh:
+        fh.write(html)
+    logger.info("HTML report escrito en %s", out_path)
+
+
+def select_file_and_process(path: str):
+    """Flujo completo: extrae texto de `path`, analiza y genera HTML."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.pdf':
+        text = extract_text_from_pdf(path)
+        if not text.strip():
+            logger.info("No se extrajo texto; intentando OCR para PDF escaneado.")
+            text = extract_text_from_scanned_pdf(path)
+    else:
+        with open(path, 'r', encoding='utf-8') as fh:
+            text = fh.read()
+
+    matcher = setup_causal_matcher(nlp)
+    highlights = analyze_text(text, matcher)
+    generate_html_report(text, highlights)
+
+
+def run_gui():
+    """Interfaz mínima usando tkinter. Importa tkinter internamente para evitar dependencia global."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox
+    except Exception:
+        logger.exception("tkinter no disponible; GUI deshabilitada.")
+        return
+
+    root = tk.Tk()
+    root.title("Causa-Efecto Highlighter")
+
+    def pick_and_run():
+        p = filedialog.askopenfilename()
+        if p:
+            try:
+                select_file_and_process(p)
+                messagebox.showinfo("Listo", "Reporte generado: highlighted_report.html")
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+    btn = tk.Button(root, text="Seleccionar archivo y analizar", command=pick_and_run)
+    btn.pack(padx=20, pady=20)
+    root.mainloop()
+
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) > 1:
+        select_file_and_process(sys.argv[1])
+    else:
+        print("Uso: python main.py <archivo>\nO ejecute run_gui() en una sesión interactiva para iniciar la GUI.")
 
 
 def extract_cause_effect(sent):
